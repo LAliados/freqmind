@@ -1,0 +1,15 @@
+CompileFlags:
+  CompilationDatabase: .
+  Remove:
+    - -mpreferred-stack-boundary=*
+    - -mindirect-branch=*
+    - -mindirect-branch-register
+    - -fno-allow-store-data-races
+    - -fconserve-stack
+    - -fsanitize=bounds-strict
+    - -mrecord-mcount
+    - -mfunction-return=*
+    - -mindirect-branch-cs-prefix
+  Add:
+    - -Wno-unknown-warning-option
+    - -Wno-unused-command-line-argument
