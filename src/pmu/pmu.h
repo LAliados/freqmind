@@ -42,7 +42,7 @@ enum pmu_event_id {
 };
 
 /**
- * struct pmu_counter - Private PMU counter set.
+ * struct pmu_counter - Private per-CPU PMU counter set.
  *
  * All fields are private implementation details. They intentionally start with
  * an underscore to make it clear that users of this module must not access or
@@ -51,29 +51,36 @@ enum pmu_event_id {
 typedef struct {
     struct perf_event* _events[PMU_EVENT_COUNT];
     u64 _prev_values[PMU_EVENT_COUNT];
+    int _cpu;
     struct mutex _lock;
     bool _created;
 } pmu_counter;
 
 /**
- * pmu_create_counter() - Create, start, and initialize PMU event baselines.
+ * pmu_create_counter() - Create, start, and initialize PMU counters on one CPU.
  * @counter: Counter object to initialize.
+ * @cpu: CPU number on which all counters should be created.
  *
- * Creates one kernel perf event for every entry in PMU_EVENT_LIST. Events are
- * task-bound to the current task and start counting immediately.
+ * Creates one per-CPU kernel perf event for every entry in PMU_EVENT_LIST.
+ * The events are bound to @cpu and are not bound to any particular task.
  *
- * After all events are created, the function reads their current cumulative
- * values and stores them as the initial baseline. Therefore, the first
- * pmu_read_events() call returns the delta since pmu_create_counter().
+ * This means the counters measure activity on the selected CPU regardless of
+ * which task is running there. The exact privilege levels being counted depend
+ * on the exclude_* fields configured in pmu.c.
+ *
+ * After all events are created and enabled, this function reads their current
+ * cumulative values and stores them as the initial baseline. Therefore, the
+ * first pmu_read_events() call returns the delta since pmu_create_counter().
  *
  * The function is all-or-nothing: if any event cannot be created, all already
  * created events are released before returning an error.
  *
  * Context: process context. Do not call from hard IRQ/NMI context.
  *
- * Return: 0 on success, or a negative errno on failure.
+ * Return: 0 on success, -EINVAL for invalid arguments, -ENODEV if @cpu is not
+ * online, or another negative errno from perf event creation.
  */
-int pmu_create_counter(pmu_counter* counter);
+int pmu_create_counter(pmu_counter* counter, int cpu);
 
 /**
  * pmu_delete_counter() - Stop and release all events owned by a counter.

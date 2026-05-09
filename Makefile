@@ -27,14 +27,15 @@ else
 
 all:
 	$(MAKE) -C $(KDIR) M=$(ROOT_DIR) modules
-	$(MAKE) move-artifacts
 
-cc: all
 	python3 $(KDIR)/scripts/clang-tools/gen_compile_commands.py \
 		-d $(KDIR) \
 		-o $(ROOT_DIR)/compile_commands.json \
 		$(BUILD_DIR)
+	$(MAKE) move-artifacts
 	mv compile_commands.json $(BUILD_DIR)
+
+cc: all
 
 move-artifacts:
 	rm -rf $(BUILD_DIR)
