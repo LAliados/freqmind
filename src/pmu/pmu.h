@@ -14,11 +14,12 @@
  *             PERF_TYPE_SOFTWARE, PERF_TYPE_HW_CACHE, PERF_TYPE_RAW.
  *   _config - event-specific config value.
  */
-#define PMU_EVENT_LIST(_X)                                                         \
-    _X(CYCLES, cycles, PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES)               \
-    _X(INSTRUCTIONS, instructions, PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS) \
-    _X(CACHE_MISSES, cache_misses, PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES) \
-    _X(BRANCH_MISSES, branch_misses, PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_MISSES)
+#define PMU_EVENT_LIST(_X)                                                            \
+    _X(CYCLES, cycles, PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES)                  \
+    _X(INSTRUCTIONS, instructions, PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS)    \
+    _X(CACHE_MISSES, cache_misses, PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES)    \
+    _X(BRANCH_MISSES, branch_misses, PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_MISSES) \
+    _X(STALLED_CYCLES_FRONTEND, stalled_cycles_frontend, PERF_TYPE_HARDWARE, PERF_COUNT_HW_STALLED_CYCLES_FRONTEND)
 
 /**
  * struct pmu_events_count - Delta snapshot of all events collected by pmu_counter.

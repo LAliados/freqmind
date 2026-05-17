@@ -6,6 +6,9 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 SRC_DIR   := $(ROOT_DIR)/src
 BUILD_DIR := $(ROOT_DIR)/build
 
+BENCHMARK_DIR_PATH := $(ROOT_DIR)/benchmarks/pmu_build
+BENCHMARK_COUNT := 5
+
 SRCS := $(shell find $(SRC_DIR) -type f -name '*.c' | sort)
 OBJS := $(patsubst $(ROOT_DIR)/%.c,%.o,$(SRCS))
 
@@ -19,7 +22,7 @@ obj-m := $(MODULE).o
 $(MODULE)-y := $(OBJS)
 
 ccflags-y += -I$(ROOT_DIR)/src
-ccflags-y += -Wall -Wextra
+ccflags-y += -Wall -Wextra -DBENCHMARK_DIR_PATH=\"$(BENCHMARK_DIR_PATH)\" -DBENCHMARK_COUNT=$(BENCHMARK_COUNT)
 
 else
 
@@ -36,6 +39,18 @@ all:
 	mv compile_commands.json $(BUILD_DIR)
 
 cc: all
+
+train: 
+	cd benchmarks && sudo ../run_pmu_sweep.sh pmu_x86_load.c
+	python3 pretrain.py benchmarks/pmu_results.csv     --layer-dims 1     --activations none     --epochs 2000     --batch-size 32     --c-prefix perf_mlp     --c-output src/perf_mlp_params.h
+	$(MAKE) -C $(KDIR) M=$(ROOT_DIR) modules
+
+	python3 $(KDIR)/scripts/clang-tools/gen_compile_commands.py \
+		-d $(KDIR) \
+		-o $(ROOT_DIR)/compile_commands.json \
+		$(BUILD_DIR)
+	$(MAKE) move-artifacts
+	mv compile_commands.json $(BUILD_DIR)
 
 move-artifacts:
 	rm -rf $(BUILD_DIR)
