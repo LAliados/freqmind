@@ -1,844 +1,1022 @@
 #include "ga.h"
 
 #include <linux/errno.h>
+#include <linux/gfp.h>
 #include <linux/kernel.h>
-#include <linux/limits.h>
-#include <linux/math64.h>
-#include <linux/overflow.h>
-#include <linux/random.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include <linux/vmalloc.h>
+#include <linux/types.h>
 
-#ifndef S64_MIN
-#define S64_MIN ((s64)(-9223372036854775807LL - 1))
+/*
+ * Fixed-point GA implementation for Linux kernel modules.
+ *
+ * No libc, no floating point, no libm.
+ *
+ * Important:
+ *     This file intentionally does not use:
+ *         - compiler-emitted 128-bit arithmetic helpers
+ *         - FXP_MUL
+ *         - FXP_DIV
+ *         - FXP_DIV_INT
+ *
+ * Reason:
+ *     Some kernel-module builds cannot link compiler runtime helpers for
+ *     wide integer division.
+ */
+
+#define GA_U64_MAX_VALUE (~0ULL)
+#define GA_S64_MAX_VALUE ((s64)((~0ULL) >> 1))
+#define GA_S64_MIN_VALUE (-GA_S64_MAX_VALUE - 1)
+
+#ifndef GA_INCEST_RATE_RAW
+#define GA_INCEST_RATE_RAW ((s64)(FXP48_16_ONE / 4)) /* 0.25 */
 #endif
 
-#ifndef S64_MAX
-#define S64_MAX ((s64)9223372036854775807LL)
+#ifndef GA_INCEST_NOISE_RAW
+#define GA_INCEST_NOISE_RAW ((s64)((FXP48_16_ONE * 35) / 100)) /* 0.35 */
 #endif
 
-#define KGA_NEG_INF (S64_MIN / 4)
-#define KGA_MAX_NORM_PPM (1000LL * (s64)KGA_PPM)
+#ifndef GA_INCEST_BLEND_NOISE_RAW
+#define GA_INCEST_BLEND_NOISE_RAW ((s64)((FXP48_16_ONE * 10) / 100)) /* 0.10 */
+#endif
 
-struct kga_one_case_result {
-    s64 best_score;
-    u32 evaluations;
-};
-
-struct kga_regularized_ctx {
-    kga_score_fn raw_score_fn;
-    void* raw_user_data;
-
-    const s64* base_params;
-    const s64* previous_params;
-
-    const struct kga_config* cfg;
-};
-
-void kga_default_config(struct kga_config* cfg) {
-    memset(cfg, 0, sizeof(*cfg));
-
-    cfg->population_size = 8;
-    cfg->epochs = 4;
-    cfg->offspring = 4;
-    cfg->tournament_size = 3;
-
-    cfg->mutation_rate_ppm = 0;
-
-    cfg->sigma_ppm = 25000;
-    cfg->min_sigma_ppm = 1;
-    cfg->max_sigma_ppm = 250000;
-
-    cfg->sigma_decay_ppm = 970000;
-    cfg->sigma_growth_ppm = 1050000;
-
-    cfg->blend_alpha_ppm = 200000;
-    cfg->elite_gene_rate_ppm = 100000;
-
-    cfg->gradient_child_rate_ppm = 350000;
-    cfg->gradient_lr_ppm = 15000;
-    cfg->gradient_eps_ppm = 20000;
-    cfg->gradient_noise_ppm = 100000;
-    cfg->gradient_clip_ppm = 3000000;
-
-    cfg->base_penalty = 1000;
-    cfg->step_penalty = 10000;
-    cfg->max_step_drift_ppm = 250000;
-
-    cfg->accept_rate_ppm = 200000;
-
-    cfg->seed = 0;
-
-    cfg->lower = NULL;
-    cfg->upper = NULL;
-    cfg->step = NULL;
-
-    cfg->gfp = GFP_KERNEL;
+static fxp_t ga_fxp_zero(void) {
+    return FXP_FROM_INT(0);
 }
 
-static void* kga_alloc_array(size_t count, size_t size, gfp_t gfp) {
-    if (size != 0 && count > SIZE_MAX / size)
-        return NULL;
-
-    return kvmalloc(count * size, gfp);
+static fxp_t ga_fxp_one(void) {
+    return FXP_FROM_INT(1);
 }
 
-static s64 kga_abs64_safe(s64 v) {
-    if (v == S64_MIN)
-        return S64_MAX;
-
-    return v < 0 ? -v : v;
+static fxp_t ga_fxp_raw(s64 raw) {
+    return FXP48_16_RAW(raw);
 }
 
-static s64 kga_saturating_add_s64(s64 a, s64 b) {
-    s64 out;
-
-    if (check_add_overflow(a, b, &out))
-        return b < 0 ? -S64_MAX : S64_MAX;
-
-    return out;
+static fxp_t ga_fxp_neg_inf(void) {
+    return ga_fxp_raw((s64)(GA_S64_MIN_VALUE / 4));
 }
 
-static s64 kga_saturating_sub_s64(s64 a, s64 b) {
-    s64 out;
+static u64 ga_abs_s64_to_u64(s64 x) {
+    if (x >= 0)
+        return (u64)x;
 
-    if (check_sub_overflow(a, b, &out))
-        return b > 0 ? -S64_MAX : S64_MAX;
+    if (x == GA_S64_MIN_VALUE)
+        return ((u64)1) << 63;
 
-    return out;
+    return (u64)(-x);
 }
 
-static s64 kga_mul_scaled_s64(s64 value, s64 scaled) {
-    s64 product;
-    s64 result;
+static fxp_t ga_fxp_from_mag(int negative, u64 mag) {
+    if (negative) {
+        if (mag >= (((u64)1) << 63))
+            return ga_fxp_raw(GA_S64_MIN_VALUE);
 
-    if (!value || !scaled)
-        return 0;
-
-    if (check_mul_overflow(value, scaled, &product)) {
-        bool neg = (value < 0) ^ (scaled < 0);
-
-        return neg ? -S64_MAX : S64_MAX;
+        return ga_fxp_raw(-(s64)mag);
     }
 
-    result = div64_s64(product, KGA_PPM);
+    if (mag > (u64)GA_S64_MAX_VALUE)
+        return ga_fxp_raw(GA_S64_MAX_VALUE);
 
-    return result;
+    return ga_fxp_raw((s64)mag);
 }
 
-static s64 kga_mul_ppm(s64 value, u32 ppm) {
-    return kga_mul_scaled_s64(value, ppm);
+static u64 ga_u64_add_sat(u64 a, u64 b) {
+    if (a > GA_U64_MAX_VALUE - b)
+        return GA_U64_MAX_VALUE;
+
+    return a + b;
 }
 
-static void kga_clamp_param(s64* v, u32 j, const struct kga_config* cfg) {
-    if (cfg->lower && *v < cfg->lower[j])
-        *v = cfg->lower[j];
+static u64 ga_u64_shl_sat(u64 v, unsigned int shift) {
+    if (shift >= 64)
+        return v ? GA_U64_MAX_VALUE : 0;
 
-    if (cfg->upper && *v > cfg->upper[j])
-        *v = cfg->upper[j];
+    if (v > (GA_U64_MAX_VALUE >> shift))
+        return GA_U64_MAX_VALUE;
+
+    return v << shift;
 }
 
-static s64 kga_param_step(s64 value, u32 j, const struct kga_config* cfg) {
-    s64 s;
+/*
+ * Compute saturating ((a * b) >> 16) using only 32x32->64 products.
+ */
+static u64 ga_umul_shr16_sat(u64 a, u64 b) {
+    u64 ah = a >> 32;
+    u64 al = a & 0xffffffffULL;
+    u64 bh = b >> 32;
+    u64 bl = b & 0xffffffffULL;
+    u64 acc = 0;
+    u64 part;
 
-    if (cfg->step) {
-        s = kga_abs64_safe(cfg->step[j]);
-        return s > 0 ? s : 1;
+    part = al * bl;
+    acc = ga_u64_add_sat(acc, part >> 16);
+
+    part = ah * bl;
+    acc = ga_u64_add_sat(acc, ga_u64_shl_sat(part, 16));
+
+    part = al * bh;
+    acc = ga_u64_add_sat(acc, ga_u64_shl_sat(part, 16));
+
+    part = ah * bh;
+    acc = ga_u64_add_sat(acc, ga_u64_shl_sat(part, 48));
+
+    return acc;
+}
+
+static fxp_t ga_fxp_mul_safe(fxp_t a, fxp_t b) {
+    s64 ar = FXP_RAW(a);
+    s64 br = FXP_RAW(b);
+    int negative = ((ar < 0) != (br < 0));
+    u64 amag = ga_abs_s64_to_u64(ar);
+    u64 bmag = ga_abs_s64_to_u64(br);
+    u64 mag = ga_umul_shr16_sat(amag, bmag);
+
+    return ga_fxp_from_mag(negative, mag);
+}
+
+/*
+ * Compute saturating ((num_abs << 16) / den_abs) without 128-bit division.
+ *
+ * The virtual numerator is up to 80 bits. Binary long division is used over
+ * bit positions 79..0.
+ */
+static u64 ga_udiv_scaled16_sat(u64 num_abs, u64 den_abs) {
+    u64 q = 0;
+    u64 rem = 0;
+    int pos;
+
+    if (den_abs == 0)
+        return GA_U64_MAX_VALUE;
+
+    for (pos = 79; pos >= 0; --pos) {
+        u64 bit = 0;
+
+        if (pos >= 16)
+            bit = (num_abs >> (pos - 16)) & 1ULL;
+
+        /*
+         * rem is always less than den_abs before this shift.
+         * den_abs is at most 2^63, so rem << 1 cannot exceed u64 max.
+         */
+        rem = (rem << 1) | bit;
+
+        if (rem >= den_abs) {
+            rem -= den_abs;
+
+            if (pos >= 64)
+                return GA_U64_MAX_VALUE;
+
+            q |= 1ULL << pos;
+        }
     }
 
-    if (cfg->lower && cfg->upper) {
-        s = kga_abs64_safe(cfg->upper[j] - cfg->lower[j]);
-        return s > 0 ? s : 1;
-    }
-
-    s = kga_abs64_safe(value);
-
-    return s > 0 ? s : 1;
+    return q;
 }
 
-static s64 kga_norm_ppm(s64 abs_delta, s64 scale) {
-    u64 a;
-    u64 product;
-    u64 result;
+static fxp_t ga_fxp_div_raw_safe(fxp_t a, s64 b_raw, fxp_t fallback) {
+    s64 ar = FXP_RAW(a);
+    int negative;
+    u64 amag;
+    u64 bmag;
+    u64 mag;
 
-    if (abs_delta <= 0)
-        return 0;
+    if (b_raw == 0)
+        return fallback;
 
-    if (scale <= 0)
-        return KGA_MAX_NORM_PPM;
+    negative = ((ar < 0) != (b_raw < 0));
+    amag = ga_abs_s64_to_u64(ar);
+    bmag = ga_abs_s64_to_u64(b_raw);
 
-    a = (u64)abs_delta;
+    mag = ga_udiv_scaled16_sat(amag, bmag);
 
-    if (a > U64_MAX / KGA_PPM)
-        return KGA_MAX_NORM_PPM;
-
-    product = a * KGA_PPM;
-    result = div64_u64(product, (u64)scale);
-
-    if (result > KGA_MAX_NORM_PPM)
-        return KGA_MAX_NORM_PPM;
-
-    return (s64)result;
+    return ga_fxp_from_mag(negative, mag);
 }
 
-static u32 kga_rng_next(u32* state) {
-    u32 x = *state;
+static fxp_t ga_fxp_div_safe(fxp_t a, fxp_t b, fxp_t fallback) {
+    return ga_fxp_div_raw_safe(a, FXP_RAW(b), fallback);
+}
 
-    if (!x)
-        x = get_random_u32();
+static fxp_t ga_fxp_div_int_safe(fxp_t a, s64 b, fxp_t fallback) {
+    s64 ar = FXP_RAW(a);
 
-    if (!x)
-        x = 2463534242U;
+    if (b == 0)
+        return fallback;
 
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
+    return ga_fxp_raw(ar / b);
+}
 
-    *state = x;
+static fxp_t ga_fxp_ratio(s64 num, s64 den) {
+    int negative;
+    u64 nmag;
+    u64 dmag;
+    u64 mag;
+
+    if (den == 0)
+        return ga_fxp_zero();
+
+    negative = ((num < 0) != (den < 0));
+    nmag = ga_abs_s64_to_u64(num);
+    dmag = ga_abs_s64_to_u64(den);
+
+    mag = ga_udiv_scaled16_sat(nmag, dmag);
+
+    return ga_fxp_from_mag(negative, mag);
+}
+
+static int ga_fxp_gt(fxp_t a, fxp_t b) {
+    return FXP_RAW(a) > FXP_RAW(b);
+}
+
+static int ga_fxp_lt(fxp_t a, fxp_t b) {
+    return FXP_RAW(a) < FXP_RAW(b);
+}
+
+static fxp_t ga_fxp_abs(fxp_t x) {
+    s64 raw = FXP_RAW(x);
+
+    if (raw >= 0)
+        return x;
+
+    if (raw == GA_S64_MIN_VALUE)
+        return ga_fxp_raw(GA_S64_MAX_VALUE);
+
+    return ga_fxp_raw(-raw);
+}
+
+static fxp_t ga_fxp_clamp_value(fxp_t x, fxp_t lo, fxp_t hi) {
+    if (ga_fxp_lt(x, lo))
+        return lo;
+
+    if (ga_fxp_gt(x, hi))
+        return hi;
 
     return x;
 }
 
-static u32 kga_rand_ppm(u32* state) {
-    return kga_rng_next(state) % (KGA_PPM + 1);
+static fxp_t* ga_alloc_copy(const fxp_t* src, size_t n, gfp_t flags) {
+    fxp_t* dst;
+
+    dst = kmalloc_array(n, sizeof(*dst), flags);
+    if (!dst)
+        return NULL;
+
+    memcpy(dst, src, n * sizeof(*dst));
+    return dst;
 }
 
-static u32 kga_rand_int(u32* state, u32 n) {
-    if (!n)
+static fxp_t* ga_alloc_zero_vecs(size_t count, size_t n, gfp_t flags) {
+    if (count != 0 && n > ((size_t)-1) / count)
+        return NULL;
+
+    return kcalloc(count * n, sizeof(fxp_t), flags);
+}
+
+void ga_default_config(ga_config* c, size_t n_params) {
+    if (!c)
+        return;
+
+    memset(c, 0, sizeof(*c));
+
+    c->n_params = n_params;
+
+    c->offspring_count = 20;
+    c->elite_count = 3;
+
+    c->max_generations = 1;
+    c->max_evaluations = 0;
+    c->patience_generations = 0;
+
+    c->alloc_flags = GFP_KERNEL;
+
+    c->sigma_init = ga_fxp_ratio(1, 4);     /* 0.25 */
+    c->sigma_min = ga_fxp_ratio(1, 10000);  /* 0.0001 */
+    c->sigma_decay = ga_fxp_ratio(72, 100); /* 0.72 */
+    c->sigma_grow = ga_fxp_ratio(105, 100); /* 1.05 */
+    c->sigma_max = ga_fxp_ratio(1, 2);      /* 0.50 */
+
+    c->lambda_pretrained = ga_fxp_ratio(20, 100); /* 0.20 */
+    c->lambda_start = ga_fxp_ratio(12, 100);      /* 0.12 */
+    c->lambda_step = ga_fxp_ratio(3, 100);        /* 0.03 */
+    c->lambda_radius = ga_fxp_ratio(25, 100);     /* 0.25 */
+    c->trust_radius = FXP_FROM_INT(4);
+
+    c->anchor_pull = ga_fxp_ratio(5, 100); /* 0.05 */
+
+    c->differential_rate = ga_fxp_ratio(25, 100);   /* 0.25 */
+    c->differential_weight = ga_fxp_ratio(60, 100); /* 0.60 */
+
+    c->min_improvement = ga_fxp_zero();
+    c->seed = 88172645463393265ULL;
+}
+
+static u64 ga_rng_next(struct ga* g) {
+    u64 x = g->rng;
+
+    if (x == 0)
+        x = 88172645463393265ULL;
+
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+
+    g->rng = x;
+
+    return x * 2685821657736338717ULL;
+}
+
+static fxp_t ga_rand01(struct ga* g) {
+    s64 raw = (s64)(ga_rng_next(g) & (u64)(FXP48_16_ONE - 1));
+
+    return ga_fxp_raw(raw);
+}
+
+static size_t ga_rand_index(struct ga* g, size_t n) {
+    if (n == 0)
         return 0;
 
-    return kga_rng_next(state) % n;
+    return (size_t)(ga_rng_next(g) % (u64)n);
 }
 
-static s64 kga_rand_normalish_ppm(u32* state) {
-    s64 s = 0;
+static fxp_t ga_randn(struct ga* g) {
+    s64 acc = 0;
+    size_t i;
 
-    s += kga_rand_ppm(state);
-    s += kga_rand_ppm(state);
-    s += kga_rand_ppm(state);
-    s += kga_rand_ppm(state);
-    s += kga_rand_ppm(state);
-    s += kga_rand_ppm(state);
+    /*
+     * Irwin-Hall approximation of N(0, 1):
+     *     sum_{i=1..12} U(0, 1) - 6
+     */
+    for (i = 0; i < 12; ++i)
+        acc += FXP_RAW(ga_rand01(g)) - (FXP48_16_ONE / 2);
 
-    return s - 3 * (s64)KGA_PPM;
+    return ga_fxp_raw(acc);
 }
 
-static s64 kga_safe_score(kga_score_fn fn, const s64* params, u32 n, void* user_data) {
-    s64 s = fn(params, n, user_data);
+static fxp_t ga_scale_at(const struct ga* g, size_t i) {
+    fxp_t s;
 
-    if (s <= KGA_NEG_INF)
-        return KGA_NEG_INF;
+    if (!g || !g->scale)
+        return ga_fxp_one();
+
+    s = ga_fxp_abs(g->scale[i]);
+
+    if (FXP_RAW(s) <= 0)
+        return ga_fxp_one();
 
     return s;
 }
 
-static s64 kga_regularized_score(const s64* params, u32 n, void* user_data) {
-    struct kga_regularized_ctx* ctx = user_data;
-    const struct kga_config* cfg = ctx->cfg;
-    s64 raw;
-    s64 base_drift_ppm = 0;
-    s64 step_drift_ppm = 0;
-    s64 penalty = 0;
-    u32 j;
+static s64 ga_scale_raw_at(const struct ga* g, size_t i) {
+    s64 raw = FXP_RAW(ga_scale_at(g, i));
 
-    raw = ctx->raw_score_fn(params, n, ctx->raw_user_data);
-    if (raw <= KGA_NEG_INF)
-        return KGA_NEG_INF;
+    if (raw == 0)
+        return FXP48_16_ONE;
 
-    for (j = 0; j < n; ++j) {
-        s64 scale = kga_param_step(params[j], j, cfg);
+    return raw;
+}
 
-        if (ctx->base_params) {
-            s64 d = kga_abs64_safe(params[j] - ctx->base_params[j]);
-            s64 norm_ppm = kga_norm_ppm(d, scale);
-            s64 sq = kga_mul_scaled_s64(norm_ppm, norm_ppm);
+static void ga_clamp_vec(struct ga* g, fxp_t* x) {
+    size_t i;
 
-            base_drift_ppm = kga_saturating_add_s64(base_drift_ppm, sq);
+    if (!g || !x)
+        return;
+
+    for (i = 0; i < g->n; ++i) {
+        if (g->lower && ga_fxp_lt(x[i], g->lower[i]))
+            x[i] = g->lower[i];
+
+        if (g->upper && ga_fxp_gt(x[i], g->upper[i]))
+            x[i] = g->upper[i];
+    }
+}
+
+static fxp_t ga_norm2(const struct ga* g, const fxp_t* a, const fxp_t* b) {
+    fxp_t acc = ga_fxp_zero();
+    size_t i;
+
+    if (!g || !a || !b || g->n == 0)
+        return acc;
+
+    for (i = 0; i < g->n; ++i) {
+        fxp_t diff = FXP_SUB(a[i], b[i]);
+        fxp_t d = ga_fxp_div_raw_safe(diff, ga_scale_raw_at(g, i), diff);
+        fxp_t d2 = ga_fxp_mul_safe(d, d);
+
+        acc = FXP_ADD(acc, d2);
+    }
+
+    return ga_fxp_div_int_safe(acc, (s64)g->n, acc);
+}
+
+static fxp_t ga_penalty(struct ga* g, const fxp_t* x, const fxp_t* parent) {
+    fxp_t p = ga_fxp_zero();
+    fxp_t n_pretrained;
+    fxp_t n_start;
+    fxp_t trust2;
+
+    if (!g || !x || !g->pretrained || !g->start || g->n == 0)
+        return p;
+
+    n_pretrained = ga_norm2(g, x, g->pretrained);
+    n_start = ga_norm2(g, x, g->start);
+
+    p = FXP_ADD(p, ga_fxp_mul_safe(g->lambda_pretrained, n_pretrained));
+    p = FXP_ADD(p, ga_fxp_mul_safe(g->lambda_start, n_start));
+
+    if (parent) {
+        fxp_t n_parent = ga_norm2(g, x, parent);
+
+        p = FXP_ADD(p, ga_fxp_mul_safe(g->lambda_step, n_parent));
+    }
+
+    /*
+     * No sqrt is used here.
+     *
+     * Previous formula:
+     *     if sqrt(n_start) > trust_radius:
+     *         penalty += lambda_radius * (sqrt(n_start) - trust_radius)^2
+     *
+     * Kernel-safe formula:
+     *     if n_start > trust_radius^2:
+     *         penalty += lambda_radius * (n_start - trust_radius^2)
+     */
+    trust2 = ga_fxp_mul_safe(g->trust_radius, g->trust_radius);
+
+    if (FXP_RAW(g->trust_radius) > 0 && ga_fxp_gt(n_start, trust2)) {
+        fxp_t over2 = FXP_SUB(n_start, trust2);
+
+        p = FXP_ADD(p, ga_fxp_mul_safe(g->lambda_radius, over2));
+    }
+
+    return p;
+}
+
+static int ga_same_vec(const struct ga* g, const fxp_t* a, const fxp_t* b) {
+    size_t i;
+
+    if (!g || !a || !b || g->n == 0)
+        return 0;
+
+    for (i = 0; i < g->n; ++i) {
+        fxp_t diff = ga_fxp_abs(FXP_SUB(a[i], b[i]));
+        fxp_t eps = ga_fxp_div_int_safe(ga_scale_at(g, i), 65536, ga_fxp_raw(1));
+
+        if (ga_fxp_gt(diff, eps))
+            return 0;
+    }
+
+    return 1;
+}
+
+static size_t ga_find_closest_elite(const struct ga* g, size_t parent_idx) {
+    size_t best_idx = parent_idx;
+    fxp_t best_d = ga_fxp_raw(GA_S64_MAX_VALUE);
+    const fxp_t* parent;
+    size_t j;
+
+    if (!g || g->elite_valid < 2 || parent_idx >= g->elite_valid)
+        return best_idx;
+
+    parent = g->elites + parent_idx * g->n;
+
+    for (j = 0; j < g->elite_valid; ++j) {
+        const fxp_t* candidate;
+        fxp_t d;
+
+        if (j == parent_idx)
+            continue;
+
+        candidate = g->elites + j * g->n;
+        d = ga_norm2(g, parent, candidate);
+
+        if (ga_fxp_lt(d, best_d)) {
+            best_d = d;
+            best_idx = j;
         }
-
-        if (ctx->previous_params) {
-            s64 d = kga_abs64_safe(params[j] - ctx->previous_params[j]);
-            s64 norm_ppm = kga_norm_ppm(d, scale);
-            s64 sq;
-
-            if (cfg->max_step_drift_ppm > 0 && norm_ppm > cfg->max_step_drift_ppm)
-                return KGA_NEG_INF;
-
-            sq = kga_mul_scaled_s64(norm_ppm, norm_ppm);
-
-            step_drift_ppm = kga_saturating_add_s64(step_drift_ppm, sq);
-        }
     }
 
-    base_drift_ppm = div64_s64(base_drift_ppm, n);
-    step_drift_ppm = div64_s64(step_drift_ppm, n);
-
-    if (cfg->base_penalty > 0) {
-        penalty = kga_saturating_add_s64(penalty, kga_mul_scaled_s64(cfg->base_penalty, base_drift_ppm));
-    }
-
-    if (cfg->step_penalty > 0) {
-        penalty = kga_saturating_add_s64(penalty, kga_mul_scaled_s64(cfg->step_penalty, step_drift_ppm));
-    }
-
-    if (raw <= KGA_NEG_INF + penalty)
-        return KGA_NEG_INF;
-
-    return raw - penalty;
+    return best_idx;
 }
 
-static u32 kga_best_index(const s64* scores, u32 count) {
-    u32 best = 0;
-    u32 i;
+static void ga_make_inbred_child(struct ga* g, size_t parent_idx, fxp_t* child) {
+    size_t mate_idx = ga_find_closest_elite(g, parent_idx);
+    const fxp_t* parent = g->elites + parent_idx * g->n;
+    const fxp_t* mate = g->elites + mate_idx * g->n;
+    fxp_t alpha;
+    size_t i;
 
-    for (i = 1; i < count; ++i) {
-        if (scores[i] > scores[best])
-            best = i;
-    }
+    alpha = FXP_ADD(ga_fxp_ratio(1, 2), ga_fxp_mul_safe(ga_randn(g), ga_fxp_raw(GA_INCEST_BLEND_NOISE_RAW)));
 
-    return best;
-}
+    alpha = ga_fxp_clamp_value(alpha, ga_fxp_ratio(15, 100), ga_fxp_ratio(85, 100));
 
-static u32 kga_worst_index(const s64* scores, u32 count) {
-    u32 worst = 0;
-    u32 i;
+    for (i = 0; i < g->n; ++i) {
+        fxp_t blended =
+            FXP_ADD(ga_fxp_mul_safe(alpha, parent[i]), ga_fxp_mul_safe(FXP_SUB(ga_fxp_one(), alpha), mate[i]));
 
-    for (i = 1; i < count; ++i) {
-        if (scores[i] < scores[worst])
-            worst = i;
-    }
+        fxp_t noise =
+            ga_fxp_mul_safe(ga_fxp_mul_safe(ga_fxp_mul_safe(ga_randn(g), g->sigma), ga_fxp_raw(GA_INCEST_NOISE_RAW)),
+                            ga_scale_at(g, i));
 
-    return worst;
-}
-
-static u32 kga_tournament_select(const s64* scores, u32 population_size, u32 tournament_size, u32* rng) {
-    u32 best = kga_rand_int(rng, population_size);
-    u32 i;
-
-    for (i = 1; i < tournament_size; ++i) {
-        u32 candidate = kga_rand_int(rng, population_size);
-
-        if (scores[candidate] > scores[best])
-            best = candidate;
-    }
-
-    return best;
-}
-
-static void kga_insert_if_better_than_worst(s64* population, s64* scores, u32 population_size, u32 n,
-                                            const s64* candidate, s64 candidate_score) {
-    u32 worst = kga_worst_index(scores, population_size);
-
-    if (candidate_score > scores[worst]) {
-        memcpy(population + (size_t)worst * n, candidate, (size_t)n * sizeof(s64));
-
-        scores[worst] = candidate_score;
+        child[i] = FXP_ADD(blended, noise);
     }
 }
 
-static void kga_mutate_one_gene(s64* child, u32 j, s64 parent_distance, u32 sigma_ppm, const struct kga_config* cfg,
-                                u32* rng) {
-    s64 base = kga_param_step(child[j], j, cfg);
-    s64 adaptive_step = base;
-    s64 noise_ppm;
-    s64 amp;
-    s64 delta;
+static void ga_apply_anchor_pull(struct ga* g, fxp_t* child) {
+    fxp_t a;
+    const fxp_t* anchor;
+    size_t i;
 
-    if (parent_distance > 0 && parent_distance < base)
-        adaptive_step = (base + parent_distance) / 2;
+    if (!g || !child || FXP_RAW(g->anchor_pull) <= 0)
+        return;
 
-    noise_ppm = kga_rand_normalish_ppm(rng);
+    anchor = ga_fxp_lt(ga_rand01(g), ga_fxp_ratio(1, 2)) ? g->start : g->pretrained;
 
-    amp = kga_mul_ppm(adaptive_step, sigma_ppm);
-    delta = kga_mul_scaled_s64(amp, noise_ppm);
+    a = ga_fxp_gt(g->anchor_pull, ga_fxp_one()) ? ga_fxp_one() : g->anchor_pull;
 
-    child[j] = kga_saturating_add_s64(child[j], delta);
-
-    kga_clamp_param(&child[j], j, cfg);
+    for (i = 0; i < g->n; ++i) {
+        child[i] = FXP_ADD(ga_fxp_mul_safe(FXP_SUB(ga_fxp_one(), a), child[i]), ga_fxp_mul_safe(a, anchor[i]));
+    }
 }
 
-static void kga_make_random_child(s64* child, const s64* parent_a, const s64* parent_b, const s64* best, u32 n,
-                                  u32 mutation_rate_ppm, u32 sigma_ppm, const struct kga_config* cfg, u32* rng) {
-    bool changed = false;
-    u32 j;
+static void ga_generate_initial(struct ga* g) {
+    size_t j;
 
-    for (j = 0; j < n; ++j) {
-        s64 a = parent_a[j];
-        s64 b = parent_b[j];
+    g->active_index = 0;
+    g->evaluated_in_generation = 0;
+    g->has_pending = 0;
 
-        if (kga_rand_ppm(rng) < cfg->elite_gene_rate_ppm) {
-            child[j] = best[j];
+    memcpy(g->offspring, g->start, g->n * sizeof(fxp_t));
+    g->offspring_penalty[0] = ga_penalty(g, g->offspring, NULL);
+
+    for (j = 1; j < g->offspring_count; ++j) {
+        fxp_t* child = g->offspring + j * g->n;
+
+        if (j == 1 && !ga_same_vec(g, g->start, g->pretrained)) {
+            memcpy(child, g->pretrained, g->n * sizeof(fxp_t));
         } else {
-            s64 lo = a < b ? a : b;
-            s64 hi = a > b ? a : b;
-            s64 d = hi - lo;
+            const fxp_t* base = ga_fxp_lt(ga_rand01(g), ga_fxp_ratio(75, 100)) ? g->start : g->pretrained;
 
-            if (d > 0) {
-                s64 extra = kga_mul_ppm(d, cfg->blend_alpha_ppm);
-                s64 left = kga_saturating_sub_s64(lo, extra);
-                s64 right = kga_saturating_add_s64(hi, extra);
-                s64 range = right - left;
-                s64 offset = kga_mul_ppm(range, kga_rand_ppm(rng));
+            size_t i;
 
-                child[j] = kga_saturating_add_s64(left, offset);
-            } else {
-                child[j] = a;
+            for (i = 0; i < g->n; ++i) {
+                fxp_t noise = ga_fxp_mul_safe(ga_fxp_mul_safe(ga_randn(g), g->sigma), ga_scale_at(g, i));
+
+                child[i] = FXP_ADD(base[i], noise);
             }
         }
 
-        kga_clamp_param(&child[j], j, cfg);
-
-        if (kga_rand_ppm(rng) < mutation_rate_ppm) {
-            kga_mutate_one_gene(child, j, kga_abs64_safe(a - b), sigma_ppm, cfg, rng);
-
-            changed = true;
-        }
-    }
-
-    if (!changed) {
-        u32 j2 = kga_rand_int(rng, n);
-
-        kga_mutate_one_gene(child, j2, kga_abs64_safe(parent_a[j2] - parent_b[j2]), sigma_ppm, cfg, rng);
+        ga_clamp_vec(g, child);
+        g->offspring_penalty[j] = ga_penalty(g, child, NULL);
     }
 }
 
-static void kga_estimate_spsa_direction(s8* direction, s64* plus, s64* minus, const s64* center, u32 n,
-                                        kga_score_fn score_fn, void* score_user_data, const struct kga_config* cfg,
-                                        u32* rng, s64* score_plus_out, s64* score_minus_out) {
-    u32 j;
-    s64 score_plus;
-    s64 score_minus;
+static void ga_generate_next_offspring(struct ga* g) {
+    size_t j;
 
-    for (j = 0; j < n; ++j) {
-        s64 scale = kga_param_step(center[j], j, cfg);
-        s64 delta = kga_mul_ppm(scale, cfg->gradient_eps_ppm);
-        s8 sign = kga_rand_ppm(rng) < 500000 ? -1 : 1;
+    g->active_index = 0;
+    g->evaluated_in_generation = 0;
+    g->has_pending = 0;
 
-        direction[j] = sign;
-
-        plus[j] = kga_saturating_add_s64(center[j], sign * delta);
-        minus[j] = kga_saturating_sub_s64(center[j], sign * delta);
-
-        kga_clamp_param(&plus[j], j, cfg);
-        kga_clamp_param(&minus[j], j, cfg);
+    if (g->elite_valid == 0) {
+        ga_generate_initial(g);
+        return;
     }
 
-    score_plus = kga_safe_score(score_fn, plus, n, score_user_data);
-    score_minus = kga_safe_score(score_fn, minus, n, score_user_data);
+    for (j = 0; j < g->offspring_count; ++j) {
+        size_t parent_idx = ga_rand_index(g, g->elite_valid);
+        const fxp_t* parent = g->elites + parent_idx * g->n;
+        fxp_t* child = g->offspring + j * g->n;
 
-    if (score_minus > score_plus) {
-        for (j = 0; j < n; ++j)
-            direction[j] = -direction[j];
-    }
+        if (g->elite_valid >= 2 && ga_fxp_lt(ga_rand01(g), ga_fxp_raw(GA_INCEST_RATE_RAW))) {
+            ga_make_inbred_child(g, parent_idx, child);
+        } else if (g->elite_valid >= 2 && ga_fxp_lt(ga_rand01(g), g->differential_rate)) {
+            size_t a = ga_rand_index(g, g->elite_valid);
+            size_t b = ga_rand_index(g, g->elite_valid);
+            const fxp_t* ea;
+            const fxp_t* eb;
+            const fxp_t* best = g->elites;
+            size_t i;
 
-    *score_plus_out = score_plus;
-    *score_minus_out = score_minus;
-}
+            if (b == a)
+                b = (b + 1) % g->elite_valid;
 
-static void kga_make_gradient_child(s64* child, const s64* parent, const s8* direction, u32 n, u32 sigma_ppm,
-                                    const struct kga_config* cfg, u32* rng) {
-    u32 j;
+            ea = g->elites + a * g->n;
+            eb = g->elites + b * g->n;
 
-    for (j = 0; j < n; ++j) {
-        s64 scale = kga_param_step(parent[j], j, cfg);
-        s64 grad_step = kga_mul_ppm(scale, cfg->gradient_lr_ppm);
-        s64 noise_amp;
-        s64 noise;
-        s64 noise_ppm;
+            for (i = 0; i < g->n; ++i) {
+                fxp_t diff = FXP_SUB(ea[i], eb[i]);
+                fxp_t step = ga_fxp_mul_safe(g->differential_weight, diff);
 
-        if (direction[j] < 0)
-            grad_step = -grad_step;
+                fxp_t noise = ga_fxp_mul_safe(ga_fxp_mul_safe(ga_randn(g), g->sigma), ga_scale_at(g, i));
 
-        noise_ppm = kga_rand_normalish_ppm(rng);
-
-        noise_amp = kga_mul_ppm(scale, sigma_ppm);
-        noise_amp = kga_mul_ppm(noise_amp, cfg->gradient_noise_ppm);
-        noise = kga_mul_scaled_s64(noise_amp, noise_ppm);
-
-        child[j] = kga_saturating_add_s64(parent[j], grad_step);
-        child[j] = kga_saturating_add_s64(child[j], noise);
-
-        kga_clamp_param(&child[j], j, cfg);
-    }
-}
-
-static void kga_sanitize_config(struct kga_config* cfg) {
-    if (cfg->population_size < 2)
-        cfg->population_size = 2;
-
-    if (cfg->epochs == 0)
-        cfg->epochs = 1;
-
-    if (cfg->offspring == 0)
-        cfg->offspring = 1;
-
-    if (cfg->tournament_size == 0)
-        cfg->tournament_size = 2;
-
-    if (cfg->tournament_size > cfg->population_size)
-        cfg->tournament_size = cfg->population_size;
-
-    if (cfg->mutation_rate_ppm > KGA_PPM)
-        cfg->mutation_rate_ppm = KGA_PPM;
-
-    if (cfg->sigma_ppm == 0)
-        cfg->sigma_ppm = 1;
-
-    if (cfg->min_sigma_ppm == 0)
-        cfg->min_sigma_ppm = 1;
-
-    if (cfg->max_sigma_ppm < cfg->min_sigma_ppm)
-        cfg->max_sigma_ppm = cfg->min_sigma_ppm;
-
-    if (cfg->sigma_decay_ppm == 0 || cfg->sigma_decay_ppm > KGA_PPM)
-        cfg->sigma_decay_ppm = KGA_PPM;
-
-    if (cfg->sigma_growth_ppm < KGA_PPM)
-        cfg->sigma_growth_ppm = KGA_PPM;
-
-    if (cfg->blend_alpha_ppm > KGA_PPM)
-        cfg->blend_alpha_ppm = KGA_PPM;
-
-    if (cfg->elite_gene_rate_ppm > KGA_PPM)
-        cfg->elite_gene_rate_ppm = KGA_PPM;
-
-    if (cfg->gradient_child_rate_ppm > KGA_PPM)
-        cfg->gradient_child_rate_ppm = KGA_PPM;
-
-    if (cfg->gradient_eps_ppm == 0)
-        cfg->gradient_eps_ppm = 1;
-
-    if (cfg->gradient_noise_ppm > KGA_PPM)
-        cfg->gradient_noise_ppm = KGA_PPM;
-
-    if (cfg->accept_rate_ppm == 0 || cfg->accept_rate_ppm > KGA_PPM)
-        cfg->accept_rate_ppm = KGA_PPM;
-
-    if (!cfg->gfp)
-        cfg->gfp = GFP_KERNEL;
-}
-
-static struct kga_one_case_result kga_optimize_current_case_small_step(s64* params, u32 n, kga_score_fn score_fn,
-                                                                       void* score_user_data,
-                                                                       const struct kga_config* cfg, u32* rng) {
-    struct kga_one_case_result result;
-    const size_t row_bytes = (size_t)n * sizeof(s64);
-    const size_t pop_bytes = (size_t)cfg->population_size * row_bytes;
-    s64* population = NULL;
-    s64* scores = NULL;
-    s64* child = NULL;
-    s64* plus = NULL;
-    s64* minus = NULL;
-    s8* direction = NULL;
-    u32 mutation_rate_ppm;
-    u32 sigma_ppm;
-    u32 i;
-    u32 epoch;
-
-    result.best_score = KGA_NEG_INF;
-    result.evaluations = 0;
-
-    population = kga_alloc_array(1, pop_bytes, cfg->gfp);
-    scores = kga_alloc_array(cfg->population_size, sizeof(s64), cfg->gfp);
-    child = kga_alloc_array(n, sizeof(s64), cfg->gfp);
-    plus = kga_alloc_array(n, sizeof(s64), cfg->gfp);
-    minus = kga_alloc_array(n, sizeof(s64), cfg->gfp);
-    direction = kga_alloc_array(n, sizeof(s8), cfg->gfp);
-
-    if (!population || !scores || !child || !plus || !minus || !direction)
-        goto out;
-
-    mutation_rate_ppm = cfg->mutation_rate_ppm;
-
-    if (mutation_rate_ppm == 0) {
-        mutation_rate_ppm = div64_s64(3LL * KGA_PPM, n);
-
-        if (mutation_rate_ppm > 300000)
-            mutation_rate_ppm = 300000;
-    }
-
-    if (mutation_rate_ppm > KGA_PPM)
-        mutation_rate_ppm = KGA_PPM;
-
-    sigma_ppm = cfg->sigma_ppm;
-
-    memcpy(population, params, row_bytes);
-
-    scores[0] = kga_safe_score(score_fn, population, n, score_user_data);
-
-    result.evaluations++;
-
-    for (i = 1; i < cfg->population_size; ++i) {
-        s64* ind = population + (size_t)i * n;
-        bool changed = false;
-        u32 j;
-
-        memcpy(ind, params, row_bytes);
-
-        for (j = 0; j < n; ++j) {
-            if (kga_rand_ppm(rng) < mutation_rate_ppm) {
-                kga_mutate_one_gene(ind, j, 0, sigma_ppm, cfg, rng);
-
-                changed = true;
+                child[i] = FXP_ADD(FXP_ADD(best[i], step), noise);
             }
-        }
-
-        if (!changed) {
-            u32 j2 = kga_rand_int(rng, n);
-
-            kga_mutate_one_gene(ind, j2, 0, sigma_ppm, cfg, rng);
-        }
-
-        scores[i] = kga_safe_score(score_fn, ind, n, score_user_data);
-
-        result.evaluations++;
-    }
-
-    i = kga_best_index(scores, cfg->population_size);
-    result.best_score = scores[i];
-
-    for (epoch = 0; epoch < cfg->epochs; ++epoch) {
-        bool improved = false;
-        u32 best_idx;
-        u32 k;
-
-        best_idx = kga_best_index(scores, cfg->population_size);
-
-        if (cfg->gradient_child_rate_ppm > 0 && cfg->gradient_lr_ppm > 0) {
-            const s64* current_best;
-            s64 score_plus;
-            s64 score_minus;
-
-            current_best = population + (size_t)best_idx * n;
-
-            kga_estimate_spsa_direction(direction, plus, minus, current_best, n, score_fn, score_user_data, cfg, rng,
-                                        &score_plus, &score_minus);
-
-            result.evaluations += 2;
-
-            kga_insert_if_better_than_worst(population, scores, cfg->population_size, n, plus, score_plus);
-
-            kga_insert_if_better_than_worst(population, scores, cfg->population_size, n, minus, score_minus);
-
-            if (score_plus > result.best_score) {
-                result.best_score = score_plus;
-                improved = true;
-            }
-
-            if (score_minus > result.best_score) {
-                result.best_score = score_minus;
-                improved = true;
-            }
-        }
-
-        for (k = 0; k < cfg->offspring; ++k) {
-            u32 best_idx2 = kga_best_index(scores, cfg->population_size);
-            const s64* best = population + (size_t)best_idx2 * n;
-            s64 child_score;
-            u32 worst_idx;
-            bool use_gradient;
-
-            use_gradient = cfg->gradient_child_rate_ppm > 0 && cfg->gradient_lr_ppm > 0 &&
-                           kga_rand_ppm(rng) < cfg->gradient_child_rate_ppm;
-
-            if (use_gradient) {
-                u32 parent_idx;
-                const s64* parent;
-
-                parent_idx = kga_tournament_select(scores, cfg->population_size, cfg->tournament_size, rng);
-
-                parent = population + (size_t)parent_idx * n;
-
-                kga_make_gradient_child(child, parent, direction, n, sigma_ppm, cfg, rng);
-            } else {
-                u32 parent_a_idx;
-                u32 parent_b_idx;
-                const s64* parent_a;
-                const s64* parent_b;
-
-                parent_a_idx = kga_tournament_select(scores, cfg->population_size, cfg->tournament_size, rng);
-
-                parent_b_idx = kga_tournament_select(scores, cfg->population_size, cfg->tournament_size, rng);
-
-                if (parent_b_idx == parent_a_idx && cfg->population_size > 1)
-                    parent_b_idx = kga_rand_int(rng, cfg->population_size);
-
-                parent_a = population + (size_t)parent_a_idx * n;
-                parent_b = population + (size_t)parent_b_idx * n;
-
-                kga_make_random_child(child, parent_a, parent_b, best, n, mutation_rate_ppm, sigma_ppm, cfg, rng);
-            }
-
-            child_score = kga_safe_score(score_fn, child, n, score_user_data);
-
-            result.evaluations++;
-
-            worst_idx = kga_worst_index(scores, cfg->population_size);
-
-            if (child_score > scores[worst_idx]) {
-                memcpy(population + (size_t)worst_idx * n, child, row_bytes);
-
-                scores[worst_idx] = child_score;
-                improved = true;
-
-                if (child_score > result.best_score)
-                    result.best_score = child_score;
-            }
-        }
-
-        if (improved) {
-            sigma_ppm = kga_mul_ppm(sigma_ppm, cfg->sigma_decay_ppm);
-
-            if (sigma_ppm < cfg->min_sigma_ppm)
-                sigma_ppm = cfg->min_sigma_ppm;
         } else {
-            sigma_ppm = kga_mul_ppm(sigma_ppm, cfg->sigma_growth_ppm);
+            size_t i;
 
-            if (sigma_ppm > cfg->max_sigma_ppm)
-                sigma_ppm = cfg->max_sigma_ppm;
+            for (i = 0; i < g->n; ++i) {
+                fxp_t noise = ga_fxp_mul_safe(ga_fxp_mul_safe(ga_randn(g), g->sigma), ga_scale_at(g, i));
+
+                child[i] = FXP_ADD(parent[i], noise);
+            }
+        }
+
+        ga_apply_anchor_pull(g, child);
+
+        ga_clamp_vec(g, child);
+        g->offspring_penalty[j] = ga_penalty(g, child, parent);
+    }
+}
+
+static void ga_finish_generation(struct ga* g) {
+    size_t total = 0;
+    fxp_t mean = ga_fxp_zero();
+    fxp_t norm_scale = ga_fxp_zero();
+    int improved = 0;
+    size_t j;
+    size_t new_elites;
+    size_t i;
+
+    for (j = 0; j < g->elite_valid; ++j) {
+        memcpy(g->pool + total * g->n, g->elites + j * g->n, g->n * sizeof(fxp_t));
+
+        g->pool_raw[total] = g->elite_raw[j];
+        g->pool_penalty[total] = g->elite_penalty[j];
+        total++;
+    }
+
+    for (j = 0; j < g->evaluated_in_generation; ++j) {
+        memcpy(g->pool + total * g->n, g->offspring + j * g->n, g->n * sizeof(fxp_t));
+
+        g->pool_raw[total] = g->offspring_raw[j];
+        g->pool_penalty[total] = g->offspring_penalty[j];
+        total++;
+    }
+
+    if (total == 0) {
+        g->done = 1;
+        return;
+    }
+
+    for (j = 0; j < total; ++j)
+        mean = FXP_ADD(mean, g->pool_raw[j]);
+
+    mean = ga_fxp_div_int_safe(mean, (s64)total, ga_fxp_zero());
+
+    /*
+     * Mean absolute deviation is used instead of variance/stddev.
+     * This avoids fixed-point square overflow and keeps divisor checks simple.
+     */
+    for (j = 0; j < total; ++j) {
+        fxp_t d = ga_fxp_abs(FXP_SUB(g->pool_raw[j], mean));
+
+        norm_scale = FXP_ADD(norm_scale, d);
+    }
+
+    norm_scale = ga_fxp_div_int_safe(norm_scale, (s64)total, ga_fxp_one());
+
+    if (FXP_RAW(norm_scale) <= 0)
+        norm_scale = ga_fxp_one();
+
+    for (j = 0; j < total; ++j) {
+        fxp_t normalized;
+
+        normalized = ga_fxp_div_safe(FXP_SUB(g->pool_raw[j], mean), norm_scale, ga_fxp_zero());
+
+        g->pool_fitness[j] = FXP_SUB(normalized, g->pool_penalty[j]);
+
+        if (!g->has_best_observed || ga_fxp_gt(g->pool_raw[j], FXP_ADD(g->best_observed_raw, g->min_improvement))) {
+            g->best_observed_raw = g->pool_raw[j];
+
+            memcpy(g->best_observed, g->pool + j * g->n, g->n * sizeof(fxp_t));
+
+            g->has_best_observed = 1;
+            improved = 1;
         }
     }
 
-    i = kga_best_index(scores, cfg->population_size);
-    result.best_score = scores[i];
+    memset(g->pool_selected, 0, (g->offspring_count + g->elite_count) * sizeof(unsigned char));
 
-    memcpy(params, population + (size_t)i * n, row_bytes);
+    new_elites = g->elite_count < total ? g->elite_count : total;
 
-out:
-    kvfree(population);
-    kvfree(scores);
-    kvfree(child);
-    kvfree(plus);
-    kvfree(minus);
-    kvfree(direction);
+    for (i = 0; i < new_elites; ++i) {
+        size_t best = 0;
+        fxp_t best_fit = ga_fxp_neg_inf();
+        int found = 0;
 
-    return result;
-}
+        for (j = 0; j < total; ++j) {
+            if (!g->pool_selected[j] && (!found || ga_fxp_gt(g->pool_fitness[j], best_fit))) {
+                best_fit = g->pool_fitness[j];
+                best = j;
+                found = 1;
+            }
+        }
 
-static void kga_smooth_accept_params(s64* params, const s64* previous_params, u32 n, const struct kga_config* cfg) {
-    u32 j;
+        g->pool_selected[best] = 1;
 
-    for (j = 0; j < n; ++j) {
-        s64 diff = params[j] - previous_params[j];
+        memcpy(g->elites + i * g->n, g->pool + best * g->n, g->n * sizeof(fxp_t));
 
-        params[j] = previous_params[j] + kga_mul_ppm(diff, cfg->accept_rate_ppm);
-
-        kga_clamp_param(&params[j], j, cfg);
+        g->elite_raw[i] = g->pool_raw[best];
+        g->elite_penalty[i] = g->pool_penalty[best];
+        g->elite_fitness[i] = g->pool_fitness[best];
     }
+
+    g->elite_valid = new_elites;
+
+    if (g->elite_valid > 0) {
+        memcpy(g->best_regularized, g->elites, g->n * sizeof(fxp_t));
+
+        g->best_regularized_raw = g->elite_raw[0];
+        g->best_regularized_fitness = g->elite_fitness[0];
+        g->has_best_regularized = 1;
+    }
+
+    if (improved) {
+        g->no_improve_generations = 0;
+
+        g->sigma = ga_fxp_mul_safe(g->sigma, g->sigma_grow);
+
+        if (ga_fxp_gt(g->sigma, g->sigma_max))
+            g->sigma = g->sigma_max;
+    } else {
+        g->no_improve_generations++;
+
+        g->sigma = ga_fxp_mul_safe(g->sigma, g->sigma_decay);
+
+        if (ga_fxp_lt(g->sigma, g->sigma_min))
+            g->sigma = g->sigma_min;
+    }
+
+    g->generation++;
+
+    if (g->max_generations > 0 && g->generation >= g->max_generations)
+        g->done = 1;
+
+    if (g->max_evaluations > 0 && g->evaluations >= g->max_evaluations)
+        g->done = 1;
+
+    if (g->patience_generations > 0 && g->no_improve_generations >= g->patience_generations) {
+        g->done = 1;
+    }
+
+    if (!g->done)
+        ga_generate_next_offspring(g);
 }
 
-int kga_state_init(struct kga_state* state, const s64* initial_params, u32 n, const struct kga_config* user_cfg) {
-    struct kga_config cfg;
-    size_t bytes;
+int ga_init(struct ga* g, const fxp_t* pretrained_params, const ga_config* cfg) {
+    const fxp_t* start;
+    size_t pool_cap;
+    gfp_t flags;
 
-    if (!state || !initial_params || !n)
+    if (!g || !pretrained_params || !cfg || cfg->n_params == 0)
         return -EINVAL;
 
-    if (user_cfg)
-        cfg = *user_cfg;
-    else
-        kga_default_config(&cfg);
+    memset(g, 0, sizeof(*g));
 
-    kga_sanitize_config(&cfg);
+    flags = cfg->alloc_flags ? cfg->alloc_flags : GFP_KERNEL;
 
-    memset(state, 0, sizeof(*state));
+    g->n = cfg->n_params;
 
-    bytes = (size_t)n * sizeof(s64);
+    g->offspring_count = cfg->offspring_count ? cfg->offspring_count : 20;
+    g->elite_count = cfg->elite_count ? cfg->elite_count : 3;
 
-    state->base_params = kga_alloc_array(n, sizeof(s64), cfg.gfp);
-    state->previous_params = kga_alloc_array(n, sizeof(s64), cfg.gfp);
+    if (g->elite_count > g->offspring_count)
+        g->elite_count = g->offspring_count;
 
-    if (!state->base_params || !state->previous_params) {
-        kga_state_free(state);
+    g->max_generations = cfg->max_generations;
+    g->max_evaluations = cfg->max_evaluations;
+    g->patience_generations = cfg->patience_generations;
+
+    g->sigma_init = FXP_RAW(cfg->sigma_init) > 0 ? cfg->sigma_init : ga_fxp_ratio(1, 4);
+
+    g->sigma = g->sigma_init;
+
+    g->sigma_min = FXP_RAW(cfg->sigma_min) > 0 ? cfg->sigma_min : ga_fxp_ratio(1, 10000);
+
+    g->sigma_decay = FXP_RAW(cfg->sigma_decay) > 0 && ga_fxp_lt(cfg->sigma_decay, ga_fxp_one()) ? cfg->sigma_decay
+                                                                                                : ga_fxp_ratio(72, 100);
+
+    g->sigma_grow = ga_fxp_gt(cfg->sigma_grow, ga_fxp_one()) ? cfg->sigma_grow : ga_fxp_ratio(105, 100);
+
+    g->sigma_max = FXP_RAW(cfg->sigma_max) > 0 ? cfg->sigma_max : g->sigma;
+
+    if (ga_fxp_lt(g->sigma_max, g->sigma))
+        g->sigma_max = g->sigma;
+
+    g->lambda_pretrained = cfg->lambda_pretrained;
+    g->lambda_start = cfg->lambda_start;
+    g->lambda_step = cfg->lambda_step;
+    g->lambda_radius = cfg->lambda_radius;
+    g->trust_radius = cfg->trust_radius;
+    g->anchor_pull = cfg->anchor_pull;
+    g->differential_rate = cfg->differential_rate;
+    g->differential_weight = cfg->differential_weight;
+    g->min_improvement = cfg->min_improvement;
+    g->rng = cfg->seed ? cfg->seed : 88172645463393265ULL;
+
+    start = cfg->start_params ? cfg->start_params : pretrained_params;
+
+    g->pretrained = ga_alloc_copy(pretrained_params, g->n, flags);
+    g->start = ga_alloc_copy(start, g->n, flags);
+
+    if (cfg->param_scale)
+        g->scale = ga_alloc_copy(cfg->param_scale, g->n, flags);
+
+    if (cfg->lower_bound)
+        g->lower = ga_alloc_copy(cfg->lower_bound, g->n, flags);
+
+    if (cfg->upper_bound)
+        g->upper = ga_alloc_copy(cfg->upper_bound, g->n, flags);
+
+    g->offspring = ga_alloc_zero_vecs(g->offspring_count, g->n, flags);
+    g->offspring_raw = kcalloc(g->offspring_count, sizeof(fxp_t), flags);
+    g->offspring_penalty = kcalloc(g->offspring_count, sizeof(fxp_t), flags);
+
+    g->elites = ga_alloc_zero_vecs(g->elite_count, g->n, flags);
+    g->elite_raw = kcalloc(g->elite_count, sizeof(fxp_t), flags);
+    g->elite_penalty = kcalloc(g->elite_count, sizeof(fxp_t), flags);
+    g->elite_fitness = kcalloc(g->elite_count, sizeof(fxp_t), flags);
+
+    pool_cap = g->offspring_count + g->elite_count;
+
+    if (pool_cap < g->offspring_count) {
+        ga_free(g);
         return -ENOMEM;
     }
 
-    memcpy(state->base_params, initial_params, bytes);
-    memcpy(state->previous_params, initial_params, bytes);
+    g->pool = ga_alloc_zero_vecs(pool_cap, g->n, flags);
+    g->pool_raw = kcalloc(pool_cap, sizeof(fxp_t), flags);
+    g->pool_penalty = kcalloc(pool_cap, sizeof(fxp_t), flags);
+    g->pool_fitness = kcalloc(pool_cap, sizeof(fxp_t), flags);
+    g->pool_selected = kcalloc(pool_cap, sizeof(unsigned char), flags);
 
-    state->n = n;
-    state->gfp = cfg.gfp;
-    state->rng = cfg.seed ? cfg.seed : get_random_u32();
+    g->best_regularized = kcalloc(g->n, sizeof(fxp_t), flags);
+    g->best_observed = kcalloc(g->n, sizeof(fxp_t), flags);
 
-    if (!state->rng)
-        state->rng = 2463534242U;
+    g->best_regularized_raw = ga_fxp_neg_inf();
+    g->best_regularized_fitness = ga_fxp_neg_inf();
+    g->best_observed_raw = ga_fxp_neg_inf();
+    g->has_best_regularized = 0;
+    g->has_best_observed = 0;
 
-    state->total_evaluations = 0;
-    state->train_calls = 0;
+    if (!g->pretrained || !g->start || (cfg->param_scale && !g->scale) || (cfg->lower_bound && !g->lower) ||
+        (cfg->upper_bound && !g->upper) || !g->offspring || !g->offspring_raw || !g->offspring_penalty || !g->elites ||
+        !g->elite_raw || !g->elite_penalty || !g->elite_fitness || !g->pool || !g->pool_raw || !g->pool_penalty ||
+        !g->pool_fitness || !g->pool_selected || !g->best_regularized || !g->best_observed) {
+        ga_free(g);
+        return -ENOMEM;
+    }
+
+    ga_generate_initial(g);
 
     return 0;
 }
 
-int kga_state_reset_base(struct kga_state* state, const s64* params, u32 n) {
-    if (!state || !params || !state->base_params || state->n != n)
-        return -EINVAL;
-
-    memcpy(state->base_params, params, (size_t)n * sizeof(s64));
-
-    return 0;
-}
-
-void kga_state_free(struct kga_state* state) {
-    if (!state)
+static void ga_record_result(struct ga* g, fxp_t result) {
+    if (!g->has_pending || g->done)
         return;
 
-    kvfree(state->base_params);
-    kvfree(state->previous_params);
-
-    memset(state, 0, sizeof(*state));
+    g->offspring_raw[g->active_index] = result;
+    g->evaluated_in_generation++;
+    g->evaluations++;
+    g->has_pending = 0;
 }
 
-struct kga_result kga_train(struct kga_state* state, s64* params, u32 n, kga_score_fn raw_score_fn, void* user_data,
-                            const struct kga_config* user_cfg) {
-    struct kga_result result;
-    struct kga_config cfg;
-    struct kga_regularized_ctx reg_ctx;
-    struct kga_one_case_result step_result;
-    size_t bytes;
+fxp_t* ga_get_new_parameters(struct ga* g, fxp_t previous_result) {
+    if (!g || g->done)
+        return NULL;
 
-    result.best_regularized_score = KGA_NEG_INF;
-    result.evaluations = 0;
-    result.total_evaluations = state ? state->total_evaluations : 0;
-    result.train_calls = state ? state->train_calls : 0;
+    if (g->has_pending)
+        ga_record_result(g, previous_result);
 
-    if (!state || !params || !n || !raw_score_fn)
-        return result;
+    if (g->max_evaluations > 0 && g->evaluations >= g->max_evaluations) {
+        ga_finish_generation(g);
+        return NULL;
+    }
 
-    if (!state->base_params || !state->previous_params)
-        return result;
+    if (g->evaluated_in_generation >= g->offspring_count) {
+        ga_finish_generation(g);
 
-    if (state->n != n)
-        return result;
+        if (g->done)
+            return NULL;
+    }
 
-    if (user_cfg)
-        cfg = *user_cfg;
-    else
-        kga_default_config(&cfg);
+    g->active_index = g->evaluated_in_generation;
+    g->has_pending = 1;
 
-    kga_sanitize_config(&cfg);
+    return g->offspring + g->active_index * g->n;
+}
 
-    bytes = (size_t)n * sizeof(s64);
+int ga_is_done(const struct ga* g) {
+    return !g || g->done;
+}
 
-    memcpy(state->previous_params, params, bytes);
+int ga_begin_new_argument_set(struct ga* g, const fxp_t* new_start_params) {
+    if (!g)
+        return -EINVAL;
 
-    reg_ctx.raw_score_fn = raw_score_fn;
-    reg_ctx.raw_user_data = user_data;
-    reg_ctx.base_params = state->base_params;
-    reg_ctx.previous_params = state->previous_params;
-    reg_ctx.cfg = &cfg;
+    if (!g->done)
+        return -EBUSY;
 
-    step_result = kga_optimize_current_case_small_step(params, n, kga_regularized_score, &reg_ctx, &cfg, &state->rng);
+    if (g->has_pending)
+        return -EBUSY;
 
-    kga_smooth_accept_params(params, state->previous_params, n, &cfg);
+    if (new_start_params) {
+        memmove(g->start, new_start_params, g->n * sizeof(fxp_t));
+    } else if (g->has_best_regularized) {
+        memmove(g->start, g->best_regularized, g->n * sizeof(fxp_t));
+    }
 
-    state->total_evaluations += step_result.evaluations;
-    state->train_calls++;
+    g->active_index = 0;
+    g->evaluated_in_generation = 0;
+    g->has_pending = 0;
 
-    result.best_regularized_score = step_result.best_score;
-    result.evaluations = step_result.evaluations;
-    result.total_evaluations = state->total_evaluations;
-    result.train_calls = state->train_calls;
+    g->elite_valid = 0;
 
-    return result;
+    g->best_regularized_raw = ga_fxp_neg_inf();
+    g->best_regularized_fitness = ga_fxp_neg_inf();
+    g->best_observed_raw = ga_fxp_neg_inf();
+    g->has_best_regularized = 0;
+    g->has_best_observed = 0;
+
+    g->generation = 0;
+    g->evaluations = 0;
+    g->no_improve_generations = 0;
+
+    g->sigma = g->sigma_init;
+
+    g->done = 0;
+
+    ga_generate_initial(g);
+
+    return 0;
+}
+
+const fxp_t* ga_best_parameters(const struct ga* g) {
+    if (!g)
+        return NULL;
+
+    if (!g->has_best_regularized || g->elite_valid == 0)
+        return g->start;
+
+    return g->best_regularized;
+}
+
+fxp_t ga_best_result(const struct ga* g) {
+    if (!g || !g->has_best_regularized)
+        return ga_fxp_neg_inf();
+
+    return g->best_regularized_raw;
+}
+
+const fxp_t* ga_best_observed_parameters(const struct ga* g) {
+    if (!g || !g->has_best_observed)
+        return NULL;
+
+    return g->best_observed;
+}
+
+fxp_t ga_best_observed_result(const struct ga* g) {
+    if (!g || !g->has_best_observed)
+        return ga_fxp_neg_inf();
+
+    return g->best_observed_raw;
+}
+
+size_t ga_generation(const struct ga* g) {
+    return g ? g->generation : 0;
+}
+
+size_t ga_evaluations(const struct ga* g) {
+    return g ? g->evaluations : 0;
+}
+
+void ga_free(struct ga* g) {
+    if (!g)
+        return;
+
+    kfree(g->pretrained);
+    kfree(g->start);
+    kfree(g->scale);
+    kfree(g->lower);
+    kfree(g->upper);
+
+    kfree(g->offspring);
+    kfree(g->offspring_raw);
+    kfree(g->offspring_penalty);
+
+    kfree(g->elites);
+    kfree(g->elite_raw);
+    kfree(g->elite_penalty);
+    kfree(g->elite_fitness);
+
+    kfree(g->pool);
+    kfree(g->pool_raw);
+    kfree(g->pool_penalty);
+    kfree(g->pool_fitness);
+    kfree(g->pool_selected);
+
+    kfree(g->best_regularized);
+    kfree(g->best_observed);
+
+    memset(g, 0, sizeof(*g));
 }

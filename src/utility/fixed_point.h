@@ -2,6 +2,7 @@
 #define FXP48_16_H
 
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/types.h>
 
 typedef struct {
@@ -18,13 +19,10 @@ typedef fxp48_16_t fxp_t;
  *
  *   real_value = _val / 2^16
  *
- * Переполнение и деление на ноль здесь не проверяются.
- * Для fixed-point умножения и деления используется __int128.
+ * В kernel module нельзя использовать 128-bit division: компилятор может
+ * сгенерировать runtime helper __divti3, которого нет в ядре. Поэтому
+ * fixed-point mul/div ниже используют kernel helper mul_u64_u64_div_u64().
  */
-
-#ifndef __SIZEOF_INT128__
-#error "fxp48_16_t requires __int128 support"
-#endif
 
 #define FXP48_16_RAW(x) ((fxp48_16_t){._val = (s64)(x)})
 
@@ -56,22 +54,47 @@ static inline fxp48_16_t fxp48_16_sub(fxp48_16_t a, fxp48_16_t b) {
     return FXP48_16_RAW(a._val - b._val);
 }
 
-static inline fxp48_16_t fxp48_16_mul(fxp48_16_t a, fxp48_16_t b) {
-    __int128 v;
+static inline u64 fxp48_16_abs_s64(s64 x) {
+    if (x >= 0)
+        return (u64)x;
 
-    v = (__int128)a._val * (__int128)b._val;
-    v /= FXP48_16_ONE;
+    /* Avoid undefined behaviour for -S64_MIN. */
+    return (u64)(-(x + 1)) + 1;
+}
+
+static inline fxp48_16_t fxp48_16_from_abs_sign(u64 v, bool negative) {
+    if (v > (u64)S64_MAX)
+        v = (u64)S64_MAX;
+
+    if (negative)
+        return FXP48_16_RAW(-((s64)v));
 
     return FXP48_16_RAW((s64)v);
 }
 
+static inline fxp48_16_t fxp48_16_mul(fxp48_16_t a, fxp48_16_t b) {
+    bool negative = (a._val < 0) ^ (b._val < 0);
+    u64 av = fxp48_16_abs_s64(a._val);
+    u64 bv = fxp48_16_abs_s64(b._val);
+    u64 v;
+
+    v = mul_u64_u64_div_u64(av, bv, (u64)FXP48_16_ONE);
+
+    return fxp48_16_from_abs_sign(v, negative);
+}
+
 static inline fxp48_16_t fxp48_16_div(fxp48_16_t a, fxp48_16_t b) {
-    __int128 v;
+    bool negative = (a._val < 0) ^ (b._val < 0);
+    u64 av = fxp48_16_abs_s64(a._val);
+    u64 bv = fxp48_16_abs_s64(b._val);
+    u64 v;
 
-    v = (__int128)a._val * FXP48_16_ONE;
-    v /= b._val;
+    if (bv == 0)
+        return FXP48_16_RAW(0);
 
-    return FXP48_16_RAW((s64)v);
+    v = mul_u64_u64_div_u64(av, (u64)FXP48_16_ONE, bv);
+
+    return fxp48_16_from_abs_sign(v, negative);
 }
 
 /* fixed <op> int */
